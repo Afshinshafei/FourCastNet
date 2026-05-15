@@ -194,17 +194,24 @@ def autoregressive_inference(params, ic, valid_data_full, valid_data_tp_full, mo
     seq_real_tp = torch.zeros((prediction_length, n_out_channels, img_shape_x, img_shape_y)).to(device, dtype=torch.float)
     seq_pred_tp = torch.zeros((prediction_length, n_out_channels, img_shape_x, img_shape_y)).to(device, dtype=torch.float)
 
-    valid_data = valid_data_full[ic:(ic+prediction_length*dt+n_history*dt):dt, in_channels, 0:720] #extract valid data from first year
+    forecast_only = bool(getattr(params, 'forecast_only', False))
+    if forecast_only:
+      valid_data = valid_data_full[ic:(ic+(n_history+1)*dt):dt, in_channels, 0:720]
+    else:
+      valid_data = valid_data_full[ic:(ic+prediction_length*dt+n_history*dt):dt, in_channels, 0:720] #extract valid data from first year
     # standardize
     valid_data = (valid_data - means)/stds
     valid_data = torch.as_tensor(valid_data).to(device, dtype=torch.float)
 
-    len_ic = prediction_length*dt
-    valid_data_tp = valid_data_tp_full[ic:(ic+prediction_length*dt):dt, 0:720].reshape(len_ic,n_out_channels,720,img_shape_y) #extract valid data from first year
-    # log normalize
-    eps = params.precip_eps
-    valid_data_tp = np.log1p(valid_data_tp/eps)
-    valid_data_tp = torch.as_tensor(valid_data_tp).to(device, dtype=torch.float)
+    if forecast_only:
+      valid_data_tp = None
+    else:
+      len_ic = prediction_length*dt
+      valid_data_tp = valid_data_tp_full[ic:(ic+prediction_length*dt):dt, 0:720].reshape(len_ic,n_out_channels,720,img_shape_y) #extract valid data from first year
+      # log normalize
+      eps = params.precip_eps
+      valid_data_tp = np.log1p(valid_data_tp/eps)
+      valid_data_tp = torch.as_tensor(valid_data_tp).to(device, dtype=torch.float)
 
     m = torch.as_tensor(np.load(params.time_means_path_tp)[0][out_channels])[:, 0:img_shape_x] # climatology
     m = torch.unsqueeze(m, 0)
@@ -223,12 +230,12 @@ def autoregressive_inference(params, ic, valid_data_full, valid_data_tp_full, mo
       logging.info('Begin autoregressive inference')
     
     with torch.no_grad():
-      for i in range(valid_data.shape[0]): 
+      for i in range(prediction_length): 
         if i==0: #start of sequence
           first = valid_data[0:n_history+1]
-          first_tp = valid_data_tp[0:1]
-          future = valid_data[n_history+1]
-          future_tp = valid_data_tp[1]
+          first_tp = valid_data_tp[0:1] if not forecast_only else torch.zeros((1, n_out_channels, img_shape_x, img_shape_y), device=device, dtype=torch.float)
+          future = valid_data[n_history+1] if not forecast_only else valid_data[n_history]
+          future_tp = valid_data_tp[1] if not forecast_only else first_tp[0]
           for h in range(n_history+1):
             seq_real[h] = first[h*n_in_channels:(h+1)*n_in_channels][0:n_in_channels] #extract history from 1st 
             seq_pred[h] = seq_real[h]
@@ -242,7 +249,7 @@ def autoregressive_inference(params, ic, valid_data_full, valid_data_tp_full, mo
             future_pred = model_wind(first)
           future_pred_tp = model(future_pred)
         else:
-          if i < prediction_length-1:
+          if (not forecast_only) and i < prediction_length-1:
             future = valid_data[n_history+i+1]
             future_tp = valid_data_tp[i+1]
           if orography:
@@ -253,20 +260,22 @@ def autoregressive_inference(params, ic, valid_data_full, valid_data_tp_full, mo
 
         if i < prediction_length-1: #not on the last step
           seq_pred[n_history+i+1] = future_pred
-          seq_real[n_history+i+1] = future
+          if not forecast_only:
+            seq_real[n_history+i+1] = future
+            seq_real_tp[i+1] = unlog_tp_torch(future_tp) # which is the i+1th validation data
           seq_pred_tp[i+1] = unlog_tp_torch(future_pred_tp) # this predicts 6-12 precip: 0 -> 6 (afno) -> 6-12 precip 
-          seq_real_tp[i+1] = unlog_tp_torch(future_tp) # which is the i+1th validation data
           #collect history
           history_stack = seq_pred[i+1:i+2+n_history]
 
         # ic for next wind step
         future_pred = history_stack
       
-        pred = torch.unsqueeze(seq_pred_tp[i], 0)
-        tar = torch.unsqueeze(seq_real_tp[i], 0)
-        valid_loss[i] = weighted_rmse_torch_channels(pred, tar)
-        acc[i] = weighted_acc_torch_channels(pred-m, tar-m)
-        tqe[i] = top_quantiles_error_torch(pred, tar)
+        if not forecast_only:
+          pred = torch.unsqueeze(seq_pred_tp[i], 0)
+          tar = torch.unsqueeze(seq_real_tp[i], 0)
+          valid_loss[i] = weighted_rmse_torch_channels(pred, tar)
+          acc[i] = weighted_acc_torch_channels(pred-m, tar-m)
+          tqe[i] = top_quantiles_error_torch(pred, tar)
         
         if params.log_to_screen:
           logging.info('Timestep {} of {}. TP RMS Error: {}, ACC: {}'.format((i), prediction_length, valid_loss[i,0], acc[i,0]))
@@ -289,11 +298,13 @@ if __name__ == '__main__':
     parser.add_argument("--vis", action='store_true')
     parser.add_argument("--override_dir", default=None, type = str, help = 'Path to store inference outputs; must also set --weights arg')
     parser.add_argument("--weights", default=None, type=str, help = 'Path to model weights, for use with override_dir option')
+    parser.add_argument("--forecast_only", action="store_true", help="Run autoregressive rollout using only initial condition(s) and skip skill metrics")
     
     args = parser.parse_args()
     params = YParams(os.path.abspath(args.yaml_config), args.config)
     params['world_size'] = 1
     params['global_batch_size'] = params.batch_size
+    params['forecast_only'] = args.forecast_only
 
     torch.cuda.set_device(0)
     torch.backends.cudnn.benchmark = True
